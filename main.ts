@@ -51,7 +51,11 @@ if (issue !== null) {
 }
 
 mkdirSync(out, { recursive: true });
-writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
+// board.json keeps the gate's `rows` and carries the model's own statement beside them (extra keys are allowed).
+writeFileSync(
+  join(out, 'board.json'),
+  `${JSON.stringify({ as_of: radar.as_of, model_version: radar.model_version, methodology: radar.methodology, peers: radar.peers, rows: board })}\n`,
+);
 writeFileSync(join(out, 'data.js'), dataScript(radar));
 
 /** Copy one directory's regular files into `to`, skipping names that start with a dot. */
