@@ -9,15 +9,18 @@
 // The pre-token universe is the house's own watchlist rule applied at every TVL down to the snapshot's
 // $5M cut, read from the ten fields the snapshot carries:
 //   - excluded outright: CEX wallets, names ending in a version marker (a pool of a listed protocol),
-//     names with the whole word wrapped/staked/staking, names that begin with an exchange's name;
+//     names with the whole word wrapped/staked/staking, names that begin with an exchange's name, and
+//     every bridge category DefiLlama uses (Bridge, Canonical Bridge, Cross Chain Bridge) and Liquid
+//     Staking (mostly wrapped, bridged or staked forms of tokens that already trade, such as WBTC or
+//     USDT0). A watchlist protocol is never excluded by any of these;
 //   - kept, and sorted into a lane that the value formula reads:
 //       watchlist      on the snapshot's watchlist (all 40 are always on the board);
 //       radar          passes the whole visible rule but sits below the $50M floor: the early finds;
 //       parent-listed  passes the whole visible rule and is above the floor, yet the watchlist leaves it
 //                      out: the only rule left that can exclude it is DefiLlama's parentProtocol, so it
 //                      is a product of a larger protocol whose own token status the snapshot cannot show;
-//       product        a Bridge, Canonical Bridge, Liquid Staking, Liquid Restaking or Restaked BTC
-//                      protocol: farmable and tokenless, but most of its TVL is another token in transit.
+//       product        a Liquid Restaking or Restaked BTC protocol: farmable and tokenless, but most
+//                      of its TVL is another token it holds.
 //
 // IMPLIED VALUE (what the protocol's token would be worth at launch if its record stayed as it is)
 //
@@ -25,9 +28,12 @@
 //
 //   peer_multiple  The market's own price of a dollar of TVL, read from the SAME snapshot: for every
 //                  protocol whose token trades (mcap_usd > 0, not a CEX) take mcap / TVL. The global median
-//                  is m_all; a category with n traded peers and median m_cat gets
-//                      (n x m_cat + K x m_all) / (n + K),   K = 5,
-//                  so a category with few peers leans on the whole market. Clamped to 0.05..1.5.
+//                  is m_all. A category with fewer than 3 traded peers uses m_all outright (one or
+//                  two listed tokens are an anecdote, not a price). A category with n >= 3 traded
+//                  peers and median m_cat gets
+//                      (n x m_cat + K x m_all) / (n + K),   K = 4,
+//                  i.e. weight n/(n+4) on the category, so thin categories still lean on the whole
+//                  market. Clamped to 0.05..1.5.
 //   lane_factor    1.0 watchlist and radar, 0.6 parent-listed (the value may accrue to the parent's
 //                  token), 0.35 product (a bridge or staking wrapper's TVL is mostly someone else's coin).
 //   growth_mult    sqrt(1 + g/100), g = change_7d clamped to -50..+100 (null reads as 0). Square root
@@ -66,6 +72,7 @@ export interface Snapshot {
 
 /** The model's constants, stated in the methodology note. */
 export interface ModelConstants {
+  peer_min_peers: number;
   peer_shrink_k: number;
   peer_min_multiple: number;
   peer_max_multiple: number;
@@ -83,7 +90,8 @@ export interface ModelConstants {
 export type Lane = 'watchlist' | 'radar' | 'parent-listed' | 'product';
 
 export const MODEL: ModelConstants = {
-  peer_shrink_k: 5,
+  peer_min_peers: 3,
+  peer_shrink_k: 4,
   peer_min_multiple: 0.05,
   peer_max_multiple: 1.5,
   lane_factor: { watchlist: 1, radar: 1, 'parent-listed': 0.6, product: 0.35 },
@@ -106,8 +114,16 @@ export const IMPLIED_CAP_USD = 100_000_000_000_000;
 /** How many live-token protocols the separate live list carries, by market cap. */
 export const LIVE_ROWS = 60;
 
-/** Categories the house rule leaves out as products of another token: kept, but in the product lane. */
-const PRODUCT_CATEGORIES = new Set(['Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC']);
+/**
+ * Categories left off the ranked board. Bridges are one class however DefiLlama subdivides them (Bridge,
+ * Canonical Bridge, Cross Chain Bridge): their TVL is a token that already trades, held in transit (BTC
+ * wrapped on Ethereum, a stable moved cross-chain, ETH locked for a rollup). A Liquid Staking entry is
+ * the same for a staked coin. A watchlist protocol is never dropped by this rule.
+ */
+const EXCLUDED_CATEGORIES = new Set(['Bridge', 'Canonical Bridge', 'Cross Chain Bridge', 'Liquid Staking']);
+
+/** Categories the house rule leaves out that the board keeps, discounted, in the product lane. */
+const PRODUCT_CATEGORIES = new Set(['Liquid Restaking', 'Restaked BTC']);
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
 const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
@@ -212,6 +228,7 @@ export interface RadarData {
   model: ModelConstants;
   model_version: string;
   methodology: string;
+  methodology_parts: string[];
   peers: PeerTable;
   unknown_age_days: number;
   watchlist_size: number;
@@ -267,7 +284,9 @@ export function isTokenized(p: SnapshotProtocol): boolean {
 export function laneOf(p: SnapshotProtocol, snapshot: Snapshot, watch: Set<string>): Lane | null {
   if (!isPreToken(p)) return null;
   if (watch.has(p.slug)) return 'watchlist';
+  // The watchlist check above runs first, so these exclusions can never cost the board a watchlist row.
   if (p.category === 'CEX' || VERSIONED.test(p.name) || WRAPPED_WORD.test(p.name) || EXCHANGE_PREFIX.test(p.name)) return null;
+  if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return null;
   if (p.category !== null && PRODUCT_CATEGORIES.has(p.category)) return 'product';
   return p.tvl_usd >= snapshot.floor_usd ? 'parent-listed' : 'radar';
 }
@@ -289,7 +308,8 @@ export function peerTable(snapshot: Snapshot, model: ModelConstants = MODEL): Pe
     const list = groups.get(category) ?? [];
     const med = median(list);
     const k = model.peer_shrink_k;
-    const blended = med === null ? globalMedian : (list.length * med + k * globalMedian) / (list.length + k);
+    // Fewer than peer_min_peers traded peers: the global median outright. Otherwise weight n/(n+K) on the category.
+    const blended = med === null || list.length < model.peer_min_peers ? globalMedian : (list.length * med + k * globalMedian) / (list.length + k);
     const multiple = Math.min(model.peer_max_multiple, Math.max(model.peer_min_multiple, blended));
     byCategory[category] = { category, peers: list.length, median: med === null ? null : round4(med), multiple: round4(multiple) };
   }
@@ -635,16 +655,22 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
     }));
 }
 
-/** The board's methodology note, in words, with this snapshot's own numbers filled in. */
+/** The board's methodology note as one string (board.json) ... */
 export function methodology(peers: PeerTable, unknownAge: number, model: ModelConstants = MODEL): string {
+  return methodologyParts(peers, unknownAge, model).join(' ');
+}
+
+/** ... and as its paragraphs (data.js), with this snapshot's own numbers filled in. */
+export function methodologyParts(peers: PeerTable, unknownAge: number, model: ModelConstants = MODEL): string[] {
   const lf = model.lane_factor;
   return [
     `Model ${MODEL_VERSION}. Implied value = TVL x peer multiple x lane factor x growth multiplier x age multiplier: what the protocol's token would be worth at launch if its record stayed as it is. It is an estimate, not a price or a prediction that a token will launch.`,
-    `Peer multiple: the market's price of a dollar of TVL in this same snapshot. Across ${peers.global_peers} protocols whose token trades, the median market cap / TVL is ${peers.global_median}. A category with n traded peers and median m gets (n x m + ${model.peer_shrink_k} x ${peers.global_median}) / (n + ${model.peer_shrink_k}), clamped to ${model.peer_min_multiple}..${model.peer_max_multiple}.`,
-    `Lane factor: ${lf.watchlist} for watchlist and below-floor radar protocols; ${lf['parent-listed']} for protocols above the floor that the watchlist leaves out only because DefiLlama lists a parent protocol (value may accrue to the parent); ${lf.product} for bridges and liquid-staking or restaked-BTC wrappers, whose TVL is mostly another token in transit.`,
-    `Growth multiplier: sqrt(1 + g/100), g = 7-day TVL change clamped to ${model.growth_floor}..+${model.growth_cap}%. Age multiplier, from days since DefiLlama began tracking it with no token on record: ${model.age_start} at day 0 rising to 1.0 at day ${model.age_ramp_days}, flat to day ${model.age_plateau_days}, fading to ${model.age_fade_floor} at day ${model.age_fade_days}. Young TVL is unproven; years without a token suggest none is coming. Unknown age reads as the universe median, ${unknownAge} days.`,
-    `Who is ranked: every protocol whose record carries no token (no market cap, no CoinGecko id, no symbol), minus CEX wallets, versioned pools, wrapped or staked names and exchange-branded products. Protocols whose token already trades are kept off the ranking and listed apart at their market cap. No protocol name is special-cased.`,
-  ].join(' ');
+    `Peer multiple: the market's price of a dollar of TVL in this same snapshot. Across ${peers.global_peers} protocols whose token trades, the median market cap / TVL is ${peers.global_median}. A category with fewer than ${model.peer_min_peers} traded peers uses ${peers.global_median} outright; one with n >= ${model.peer_min_peers} traded peers and median m gets (n x m + ${model.peer_shrink_k} x ${peers.global_median}) / (n + ${model.peer_shrink_k}), a weight of n/(n+${model.peer_shrink_k}) on the category, clamped to ${model.peer_min_multiple}..${model.peer_max_multiple}.`,
+    `Lane factor: ${lf.watchlist} for watchlist and below-floor radar protocols; ${lf['parent-listed']} for protocols above the floor that the watchlist leaves out only because DefiLlama lists a parent protocol (value may accrue to the parent); ${lf.product} for liquid restaking and restaked BTC, whose TVL is mostly another token they hold.`,
+    `Growth multiplier: sqrt(1 + g/100), g = 7-day TVL change clamped to ${model.growth_floor}..+${model.growth_cap}%, so one noisy week moves the value by x${Math.sqrt(1 + model.growth_floor / 100).toFixed(2)} to x${Math.sqrt(1 + model.growth_cap / 100).toFixed(2)} at most.`,
+    `Age multiplier, from days since DefiLlama began tracking it with no token on record: ${model.age_start} at day 0 rising to 1.0 at day ${model.age_ramp_days}, flat to day ${model.age_plateau_days}, fading to ${model.age_fade_floor} at day ${model.age_fade_days}. Young TVL is unproven; years without a token suggest none is coming. Unknown age reads as the universe median, ${unknownAge} days.`,
+    `Who is ranked: every protocol whose record carries no token (no market cap, no CoinGecko id, no symbol), minus CEX wallets, versioned pools, wrapped or staked names, exchange-branded products, every bridge category (Bridge, Canonical Bridge, Cross Chain Bridge) and Liquid Staking (wrapped, bridged or staked forms of tokens that already trade); every watchlist protocol stays. Protocols whose token already trades are kept off the ranking and listed apart at their market cap. No protocol name is special-cased.`,
+  ];
 }
 
 /** A board row's form for data.js. */
@@ -685,6 +711,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     model,
     model_version: MODEL_VERSION,
     methodology: methodology(peers, unknownAge, model),
+    methodology_parts: methodologyParts(peers, unknownAge, model),
     peers,
     unknown_age_days: unknownAge,
     watchlist_size: snapshot.watchlist.length,
